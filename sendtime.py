@@ -3,10 +3,11 @@
 
 from flask import Flask, request, jsonify, abort
 from werkzeug.contrib.cache import SimpleCache
-import os
+from secrets import token_hex
 import erppeek
 import time
 import datetime
+from calendar import monthrange
 
 
 app = Flask(__name__)
@@ -14,46 +15,26 @@ app.config.from_envvar("SENDTIME_SETTINGS")
 cache = SimpleCache()
 
 
-def current_user():
+def current_user(client):
     user = request.environ.get('REMOTE_USER')
     if user is None:
         if app.config["DEBUG"] != 0:
             user = "rasky"
         else:
             abort(400, {'error': 'REMOTE_USER not provided'})
-
-    # See if we have a client already in list
-    pwd = cache.get("pwd:" + user)
-    if pwd is None:
-        # Login as admin to retrieve userid and password for this user
-        # NOTE: Odoo saves passwords in clear... furtunately, we don't store
-        # the real passwords here (because we authenticate via SSO), but just
-        # a random-generated password.
-        client = odoo_client(
-            app.config["ODOO_USER"], app.config["ODOO_PASSWORD"])
-        record = client.ResUsers.read(
-            ["login="+user], fields=["id", "password"])[0]
-
-        # Some users have no password
-        # (so login it's impossible with erppeek),
-        # or they have a manually generated password that we don't trust.
-        # Let's replace it.
-        if len(record["password"]) < 32:
-            newpwd = os.urandom(16).encode("hex")
-            client.ResUsers.write(record["id"], {"password": newpwd})
-            record["password"] = newpwd
-
-        cache.set("id:"+user, record["id"])
-        cache.set("pwd:"+user, record["password"])
-
-    return user, cache.get("id:"+user), cache.get("pwd:"+user)
+    # Retrieve odoo user id of this user
+    record = client.ResUsers.read([('login', '=', user)], fields=["id"])
+    if not record:
+        abort(400, {'error': 'This user does not exist in Odoo'})
+    return record[0]["id"]
 
 
-def odoo_client(login, password):
+def odoo_client():
     return erppeek.Client(
         app.config["ODOO_URI"],
         app.config["ODOO_DB"],
-        login, password)
+        app.config["ODOO_USER"],
+        app.config["ODOO_PASSWORD"])
 
 
 @app.errorhandler(500)
@@ -62,10 +43,15 @@ def server_error(e):
         {"error": "internal server error", "exception": str(e)}), 500
 
 
+@app.route('/check')
+def check():
+    return jsonify({'message': 'It works!'})
+
+
 @app.route('/api/timesheet', methods=["POST"])
 def get_timesheet():
-    login, userid, pwd = current_user()
-    client = odoo_client(login, pwd)
+    client = odoo_client()
+    userid = current_user(client)
 
     if request.json is None:
         abort(400, {'error': 'request body not in JSON format'})
@@ -94,9 +80,9 @@ def get_timesheet():
         abort(400, {'error': 'project not provided'})
 
     # Extract project id from OpenERP (with unambiguous match)
-    pids = client.AccountAnalyticAccount.read(
-        ["use_timesheets=True", "state=open", "name ilike " + proj],
-        fields=["name"])
+    pids = client.ProjectProject.read([('active', '=', True),
+                                       ('name', 'ilike', proj), ],
+                                      fields=["name"])
     if len(pids) == 0:
         abort(400, {'error': 'no project found matching %s' % proj})
     elif len(pids) > 1:
@@ -108,13 +94,16 @@ def get_timesheet():
     projectid = pids[0]["id"]
 
     # Search for a draft timesheet for this user
-    # NOTE: some timesheets are in state "draft_positive". Not sure what
-    # that means, but they must be matched here
-    sheetid = client.Hr_timesheet_sheetSheet.search(
-        ["state like draft%",
-         "user_id=%d" % userid,
-         "date_from=%04d-%02d-01" % (date.year, date.month)],
-    )
+    sheetid = client.Hr_timesheetSheet.search([
+        ('state', 'in', ('draft', 'new')),
+        ('user_id', '=', userid),
+        ('date_start', '>=', '%04d-%02d-01' % (date.year, date.month)),
+        ('date_end', '<=', '%04d-%02d-%02d' % (
+            date.year,
+            date.month,
+            monthrange(date.year, date.month)[1],
+            ))
+        ])
     if len(sheetid) == 0:
         abort(
             400,
@@ -125,14 +114,12 @@ def get_timesheet():
     sheetid = sheetid[0]
 
     # Now create a registration
-    newrecord = client.HrAnalyticTimesheet.create({
-        "journal_id": 6,  # Hard-coded timesheet journal used by Develer
-        "account_id": projectid,
-        "sheet_id": sheetid,
-        "date": date.strftime("%Y-%m-%d"),
-        "unit_amount": float(minutes)/60,
-        "user_id": userid,
-        "name": desc,
+    newrecord = client.AccountAnalyticLine.create({
+        'date': date.strftime('%Y-%m-%d'),
+        'project_id': projectid,
+        'name': desc,
+        'unit_amount': float(minutes)/60,
+        'user_id': userid,
     })
 
     return jsonify({
